@@ -48,3 +48,6 @@ zookeeper-data/
 
 # Logs
 *.log
+
+# Analytics outputs
+outputs/

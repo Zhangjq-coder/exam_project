@@ -24,8 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DATA_LAKE_PATH = 'file:///C:/tmp/datalake'
-CHECKPOINT_BASE = 'file:///C:/tmp/datalake/checkpoints'
+DATA_LAKE_PATH = 'C:/tmp/datalake'
+CHECKPOINT_BASE = 'C:/tmp/datalake/checkpoints'
 BOOTSTRAP_SERVERS = 'localhost:9092,localhost:9093,localhost:9094'
 TOPIC = 'sensor-events'
 RAW_PATH = DATA_LAKE_PATH + '/raw/source=kafka/topic=sensor-events'
