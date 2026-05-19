@@ -5,6 +5,7 @@ Consumes sensor-events from Kafka, processes events, and writes to three-zone da
 
 import logging
 import os
+import threading
 import time
 
 from pyspark.sql import SparkSession
@@ -22,26 +23,6 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-
-
-class ProgressListener:
-    """Streaming query listener that logs progress events."""
-    def __init__(self, zone_name):
-        self.zone_name = zone_name
-        self.batch_count = 0
-        self.total_rows = 0
-
-    def on_query_progress(self, event):
-        self.batch_count += 1
-        rows = event['numInputRows']
-        self.total_rows += rows
-        logger.info(
-            '[%s] Batch#%d | input=%d rows | total=%d rows | '
-            'duration=%.2fs | offset=%s',
-            self.zone_name, self.batch_count, rows, self.total_rows,
-            event.get('batchDuration', 0) / 1000,
-            event.get('sources', [{}])[0].get('endOffset', 'N/A')
-        )
 
 DATA_LAKE_PATH = 'file:///C:/tmp/datalake'
 CHECKPOINT_BASE = 'file:///C:/tmp/datalake/checkpoints'
@@ -202,6 +183,34 @@ def write_consumption_zone(df):
         .start()
 
 
+def progress_monitor(queries, stop_event):
+    """Background thread that polls streaming query progress every 15s."""
+    seen_offsets = {}
+    while not stop_event.is_set():
+        time.sleep(15)
+        if stop_event.is_set():
+            break
+        all_idle = True
+        for name, q in queries.items():
+            if not q.isActive:
+                logger.warning('[%s] Query is NOT active!', name)
+                continue
+            progress = q.lastProgress
+            if progress:
+                src = progress.get('sources', [{}])[0]
+                end_offset = str(src.get('endOffset', 'N/A'))
+                if end_offset not in seen_offsets:
+                    seen_offsets[end_offset] = True
+                    all_idle = False
+                logger.info(
+                    '[%s] batchId=%s | input=%d rows | offset=%s',
+                    name,
+                    progress.get('batchId', '?'),
+                    progress['numInputRows'],
+                    end_offset
+                )
+
+
 def main():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel('WARN')
@@ -232,17 +241,35 @@ def main():
     curated_query = write_curated_zone(enriched_df)
     consumption_query = write_consumption_zone(enriched_df)
 
-    raw_query.addListener(ProgressListener('RAW'))
-    curated_query.addListener(ProgressListener('CURATED'))
-    consumption_query.addListener(ProgressListener('CONSUMPTION'))
+    queries = {
+        'RAW': raw_query,
+        'CURATED': curated_query,
+        'CONSUMPTION': consumption_query
+    }
 
     logger.info('Starter status:')
-    logger.info('  RAW         - isActive=%s, id=%s', raw_query.isActive, str(raw_query.id)[:8])
-    logger.info('  CURATED     - isActive=%s, id=%s', curated_query.isActive, str(curated_query.id)[:8])
-    logger.info('  CONSUMPTION - isActive=%s, id=%s', consumption_query.isActive, str(consumption_query.id)[:8])
+    for name, q in queries.items():
+        logger.info('  %-11s - isActive=%s, id=%s', name, q.isActive, str(q.id)[:8])
+
+    stop_event = threading.Event()
+    monitor = threading.Thread(
+        target=progress_monitor, args=(queries, stop_event), daemon=True
+    )
+    monitor.start()
+    logger.info('Progress monitor started (logs every 15s)')
     logger.info('Waiting for micro-batches (trigger every 30s)...')
 
-    spark.streams.awaitAnyTermination()
+    try:
+        spark.streams.awaitAnyTermination()
+    except KeyboardInterrupt:
+        logger.info('KeyboardInterrupt received, shutting down...')
+    finally:
+        stop_event.set()
+        for name, q in queries.items():
+            if q.isActive:
+                q.stop()
+        monitor.join(timeout=5)
+        logger.info('Pipeline stopped.')
 
 
 if __name__ == '__main__':
